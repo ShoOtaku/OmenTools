@@ -17,7 +17,7 @@ using Control = FFXIVClientStructs.FFXIV.Client.Game.Control.Control;
 
 namespace OmenTools.OmenService;
 
-public partial class MovementManager
+public unsafe partial class MovementManager
 {
     private static readonly CompSig CurrentMoveModeInternalSig = new("0F B6 0D ?? ?? ?? ?? B8");
     private                 byte*   CurrentMoveModeInternal    = null!;
