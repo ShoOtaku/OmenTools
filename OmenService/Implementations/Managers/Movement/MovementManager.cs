@@ -19,16 +19,11 @@ using Action = System.Action;
 
 namespace OmenTools.OmenService;
 
-public partial class MovementManager : OmenServiceBase<MovementManager>
+public partial class MovementManager
+(
+    ExecuteCommandManager executeCommandManager
+) : OmenServiceBase<MovementManager>
 {
-    private readonly ExecuteCommandManager executeCommandManager;
-
-    public MovementManager
-    (
-        ExecuteCommandManager inExecuteCommandManager
-    ) =>
-        executeCommandManager = inExecuteCommandManager;
-
     public delegate bool TPSmartInZoneDelegate
     (
         Vector3         pos,
@@ -344,7 +339,10 @@ public partial class MovementManager : OmenServiceBase<MovementManager>
         instance = null;
 
         if (!LayoutWorld.Instance()->ActiveLayout->InstancesByType.TryGetValuePointer
-                (InstanceType.ExitRange, out var exitRanges))
+            (
+                InstanceType.ExitRange,
+                out var exitRanges
+            ))
             return false;
 
         foreach (var exitRange in exitRanges->Value->Values)

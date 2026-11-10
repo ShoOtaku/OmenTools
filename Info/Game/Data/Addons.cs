@@ -16,6 +16,8 @@ public static unsafe class Addons
     public static AtkUnitBase* PartyList              => AddonHelper.GetByName("_PartyList");
     public static AtkUnitBase* TitleMenu              => AddonHelper.GetByName("_TitleMenu");
     public static AtkUnitBase* TitleLogo              => AddonHelper.GetByName("_TitleLogo");
+    public static AtkUnitBase* TitleRevision          => AddonHelper.GetByName("_TitleRevision");
+    public static AtkUnitBase* TitleRights            => AddonHelper.GetByName("_TitleRights");
     public static AtkUnitBase* TargetInfo             => AddonHelper.GetByName("_TargetInfo");
     public static AtkUnitBase* TargetInfoMainTarget   => AddonHelper.GetByName("_TargetInfoMainTarget");
     public static AtkUnitBase* TargetInfoCastBar      => AddonHelper.GetByName("_TargetInfoCastBar");
@@ -35,6 +37,41 @@ public static unsafe class Addons
     public static AtkUnitBase* ChatLogPanel0          => AddonHelper.GetByName("ChatLogPanel_0");
     public static AtkUnitBase* ChatLogPanel1          => AddonHelper.GetByName("ChatLogPanel_1");
     public static AtkUnitBase* ChatLogPanel2          => AddonHelper.GetByName("ChatLogPanel_2");
+
+    /// <summary>
+    ///     获取“魔光键影”的通关提示子界面，未加载时返回空指针。
+    /// </summary>
+    public static AtkUnitBase* KTGClear => AddonHelper.GetByName("_KTGClear");
+
+    /// <summary>
+    ///     获取“魔光键影”的倒计时子界面，未加载时返回空指针。
+    /// </summary>
+    public static AtkUnitBase* KTGCountDown => AddonHelper.GetByName("_KTGCountDown");
+
+    /// <summary>
+    ///     获取“魔光键影”的游戏结束提示子界面，未加载时返回空指针。
+    /// </summary>
+    public static AtkUnitBase* KTGGameover => AddonHelper.GetByName("_KTGGameover");
+
+    /// <summary>
+    ///     获取“魔光键影”的区域标题子界面，未加载时返回空指针。
+    /// </summary>
+    public static AtkUnitBase* KTGLocationTitle => AddonHelper.GetByName("_KTGLocationTitle");
+
+    /// <summary>
+    ///     获取“魔光键影”的开始提示子界面，未加载时返回空指针。
+    /// </summary>
+    public static AtkUnitBase* KTGStart => AddonHelper.GetByName("_KTGStart");
+
+    /// <summary>
+    ///     获取“魔光键影”的警告提示子界面，未加载时返回空指针。
+    /// </summary>
+    public static AtkUnitBase* KTGWarning => AddonHelper.GetByName("_KTGWarning");
+
+    /// <summary>
+    ///     获取“魔光键影”的波次提示子界面，未加载时返回空指针。
+    /// </summary>
+    public static AtkUnitBase* KTGWave => AddonHelper.GetByName("_KTGWave");
 
     #endregion
 

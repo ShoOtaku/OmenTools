@@ -4,6 +4,7 @@ using Dalamud.Game.ClientState.Conditions;
 using FFXIVClientStructs.FFXIV.Client.Game.Event;
 using Lumina.Excel.Sheets;
 using OmenTools.Dalamud;
+using OmenTools.Info.Game.AetheryteRecord;
 using OmenTools.Info.Game.AetheryteRecord.Data;
 using OmenTools.Info.Game.Packets.Upstream;
 using OmenTools.Info.Lumina;
@@ -30,17 +31,13 @@ public unsafe partial class MovementManager
     private byte* CurrentZoneMoveStateBaseInstance = null!;
 
     private static readonly CompSig GetCurrentZoneMoveStateSig = new("E8 ?? ?? ?? ?? 66 83 C8 40");
+
     private delegate ushort GetCurrentZoneMoveStateDelegate
     (
         byte* instance
     );
+
     private GetCurrentZoneMoveStateDelegate GetCurrentZoneMoveState = null!;
-
-    private static uint TicketUsageGilSetting =>
-        IGameConfig.Instance().UiConfig.GetUInt("TelepoTicketGilSetting");
-
-    private static uint TicketUsageType =>
-        IGameConfig.Instance().UiConfig.GetUInt("TelepoTicketUseType");
 
     private Config config = null!;
 
@@ -159,195 +156,246 @@ public unsafe partial class MovementManager
 
     #region 路径
 
-    public static List<ZoneHop> FindBestPath
-    (
-        uint source,
-        uint target
-    )
+    /// <summary>
+    ///     按照传送券抵扣前的金币费用和换乘惩罚选择到达目的地区域的路线，同等代价时优先减少城内以太之晶的使用。
+    /// </summary>
+    /// <param name="source">出发区域编号。</param>
+    /// <param name="target">目的地区域编号。</param>
+    /// <param name="targetAetheryte">明确选择的目标以太之光；最终以传送进入目的地区域时仅使用该记录。</param>
+    /// <returns>按执行顺序排列的交通分段；无需移动或无法到达时为空。</returns>
+    public static List<ZoneHop> FindBestPath(uint source, uint target, AetheryteRecord? targetAetheryte = null)
     {
-        if (source == target) return [];
-
-        var stateKey  = new PathState(source, Vector3.Zero);
-        var bestKnown = new Dictionary<PathState, PathCost>();
-        var cameFrom  = new Dictionary<PathState, PathEdge>();
-        var pq        = new PriorityQueue<PathState, PathCost>();
-
-        bestKnown[stateKey] = new PathCost(0, 0);
-        pq.Enqueue(stateKey, new PathCost(0, 0));
-
-        PathState? targetState = null;
-
-        while (pq.TryDequeue(out var state, out var priority))
-        {
-            if (!bestKnown.TryGetValue(state, out var known)  ||
-                known.EffectiveCost != priority.EffectiveCost ||
-                known.Hops          != priority.Hops)
-                continue;
-
-            if (state.Zone == target)
-            {
-                targetState = state;
-                break;
-            }
-
-            foreach (var hop in EnumerateEdges(state.Zone, state.Zone == source))
-            {
-                var arrivalPos = hop switch
-                {
-                    AetheryteHop a   => a.Record.Position,
-                    TelepotTownHop t => t.Target.Position,
-                    _                => Vector3.Zero
-                };
-
-                var nextState = new PathState(hop.TargetZone, arrivalPos);
-
-                var hopCumulativePenalty = !Instance().AlwaysMinGilTransport && priority.Hops >= 1 ?
-                                               (uint)priority.Hops * Instance().config.HopCumulativePenalty :
-                                               0U;
-                var hopPenalty = hopCumulativePenalty + 0U;
-
-                var hopCost = hop switch
-                {
-                    AetheryteHop a => TeleportCostCalculator.GetTeleportCost
-                    (
-                        a.Record.GetData(),
-                        state.Zone,
-                        a.Record.RowID,
-                        a.Record.Group,
-                        a.Record.IsAetheryte,
-                        a.Record.IsHouse
-                    ),
-                    EventHop e => e.Method.Cost,
-                    _          => 0U
-                };
-
-                var hopIncrement = hopCost                + hopPenalty;
-                var newHops      = priority.Hops          + 1;
-                var newEffective = priority.EffectiveCost + hopIncrement;
-
-                if (bestKnown.TryGetValue(nextState, out var nextKnown) &&
-                    (nextKnown.EffectiveCost < newEffective ||
-                     (nextKnown.EffectiveCost == newEffective && nextKnown.Hops <= newHops)))
-                    continue;
-
-                bestKnown[nextState] = new PathCost(newEffective, newHops);
-                cameFrom[nextState]  = new PathEdge(hop, state);
-                pq.Enqueue(nextState, new PathCost(newEffective, newHops));
-            }
-        }
-
-        if (targetState is not { } ts || !cameFrom.ContainsKey(ts))
+        if (source == target)
             return [];
 
-        // 总是使用或不低于金额总是使用
-        if (TicketUsageType is 1 or 4                                  &&
-            LocalPlayerState.GetItemCount(TELEPORT_TICKET_ITEM_ID) > 0 &&
-            AetheryteRecordManager.Instance().GetNearestAetheryte(target, Vector3.Zero) is { } aetheryte)
+        var context = CapturePathSearch(source);
+
+        if (targetAetheryte != null)
         {
-            var directCost = TeleportCostCalculator.GetTeleportCost
-            (
-                aetheryte.GetData(),
-                source,
-                aetheryte.RowID,
-                aetheryte.Group,
-                aetheryte.IsAetheryte,
-                aetheryte.IsHouse
-            );
-
-            if (TicketUsageType == 1 || directCost > TicketUsageGilSetting)
+            context = context with
             {
-                var hasAetheryte = false;
-                var checkKey     = ts;
-
-                while (checkKey.Zone != source || checkKey.Pos != Vector3.Zero)
-                {
-                    var (ckHop, ckPrev) = cameFrom[checkKey];
-
-                    if (ckHop is AetheryteHop)
-                    {
-                        hasAetheryte = true;
-                        break;
-                    }
-
-                    checkKey = ckPrev;
-                }
-
-                if (hasAetheryte)
-                    return [new AetheryteHop(aetheryte)];
-            }
+                Aetherytes =
+                [
+                    .. context.Aetherytes.Where
+                    (x => x.TargetZone != target ||
+                          x.Record     == targetAetheryte
+                    )
+                ]
+            };
         }
 
-        var path = new Stack<ZoneHop>();
-        var cur  = ts;
+        var routes = SearchPaths(context, source, [target], CancellationToken.None);
+        if (!routes.TryGetValue(target, out var node))
+            return [];
 
-        while (cur.Zone != source || cur.Pos != Vector3.Zero)
+        var path = new Stack<ZoneHop>();
+
+        while (node.Previous is { } previous)
         {
-            var (hop, prev) = cameFrom[cur];
-            path.Push(hop);
-            cur = prev;
+            path.Push(node.Hop);
+            node = previous;
         }
 
         return [.. path];
     }
 
-    private static unsafe List<ZoneHop> EnumerateEdges
+    /// <summary>
+    ///     从同一出发区域搜索多个目的地区域，按传送券抵扣前的金币费用选路，返回所选路线的展示费用，不包含换乘惩罚。
+    /// </summary>
+    /// <param name="source">出发区域编号。</param>
+    /// <param name="targets">目的地区域编号集合。</param>
+    /// <param name="applyTeleportDiscounts">是否应用免费、收藏及住宅等以太传送折扣；关闭后按基础距离费用选路和计费。</param>
+    /// <returns>可到达的目的地区域及其展示费用；根据参数决定是否应用以太传送折扣，传送券抵扣不计入展示费用，当前区域的费用为零。</returns>
+    public static Dictionary<uint, uint> FindRouteCosts(uint source, IEnumerable<uint> targets, bool applyTeleportDiscounts = true)
+    {
+        var context = CapturePathSearch(source, applyTeleportDiscounts);
+        return SearchPaths(context, source, [.. targets], CancellationToken.None)
+            .ToDictionary(x => x.Key, x => x.Value.DisplayGilCost);
+    }
+
+    internal static async Task<Dictionary<uint, uint>> FindRouteCostsAsync
     (
-        uint zone,
-        bool isRoot
+        uint                source,
+        IReadOnlyList<uint> targets,
+        CancellationToken   cancellationToken
     )
     {
-        var edges = new List<ZoneHop>();
+        var context = await IFramework.Instance().Run
+                      (
+                          () => CapturePathSearch(source),
+                          cancellationToken
+                      ).ConfigureAwait(false);
 
-        foreach (var er in LGBAssets.ZoneLineExitRanges.GetValueOrDefault(zone, []))
-            edges.Add(new ExitRangeHop(er.TargetZone, er.Position));
+        return await Task.Run
+               (
+                   () => SearchPaths(context, source, [.. targets], cancellationToken)
+                       .ToDictionary(x => x.Key, x => x.Value.DisplayGilCost),
+                   cancellationToken
+               ).ConfigureAwait(false);
+    }
 
-        var zoneAetheryte =
-            AetheryteRecordManager.Instance().GetNearestAetheryte(zone, Vector3.Zero);
+    private static unsafe PathSearchContext CapturePathSearch(uint source, bool applyTeleportDiscounts = true)
+    {
+        var manager = Instance();
+        var records = AetheryteRecordManager.Instance().AllRecords
+                                            .Where(x => AetheryteRecords.AethernetGroups.Contains(x.Group))
+                                            .ToArray();
+        var nearest = records.Where(x => x.IsUnlocked())
+                             .GroupBy(x => x.ZoneID)
+                             .ToDictionary(x => x.Key, x => x.OrderBy(record => record.Position.LengthSquared()).First());
+        var groups = records.GroupBy(x => x.Group).ToDictionary(x => x.Key, x => x.ToArray());
+        var edges  = new Dictionary<uint, List<ZoneHop>>();
 
-        if (zoneAetheryte is { Group: > 0, ZoneID: var aetheryteZoneID }                                 &&
-            LuminaGetter.GetRowOrDefault<TerritoryType>(aetheryteZoneID).TerritoryIntendedUse.RowId == 0 &&
-            (!isRoot ||
-             EventFramework.Instance()->TryGetNearestEventID
-             (
-                 x => x.EventId.ContentId is EventHandlerContent.Aetheryte,
-                 _ => true,
-                 Vector3.Zero,
-                 out _
-             )))
+        foreach (var (zone, exits) in LGBAssets.ZoneLineExitRanges)
+            edges[zone] = [.. exits.Select(x => new ExitRangeHop(x.TargetZone, x.Position))];
+
+        foreach (var (zone, aetheryte) in nearest)
         {
-            foreach (var record in AetheryteRecordManager.Instance().AllRecords)
+            if (aetheryte.Group                                                              == 0 ||
+                LuminaGetter.GetRowOrDefault<TerritoryType>(zone).TerritoryIntendedUse.RowId != 0)
+                continue;
+
+            if (zone == source &&
+                !EventFramework.Instance()->TryGetNearestEventID
+                (
+                    x => x.EventId.ContentId is EventHandlerContent.Aetheryte,
+                    _ => true,
+                    Vector3.Zero,
+                    out _
+                ))
+                continue;
+
+            if (!edges.TryGetValue(zone, out var zoneEdges))
+                edges[zone] = zoneEdges = [];
+
+            foreach (var record in groups[aetheryte.Group])
             {
-                if (record.ZoneID == zone) continue;
-
-                if (AetheryteRecordManager.Instance().AllRecords.FirstOrDefault
-                    (x => x.Group  == zoneAetheryte.Group &&
-                          x.ZoneID == record.ZoneID
-                    )
-                    is null)
-                    continue;
-
-                edges.Add(new TelepotTownHop(record));
+                if (record.ZoneID != zone)
+                    zoneEdges.Add(new TelepotTownHop(record));
             }
         }
 
-        foreach (var method in Instance().EventTransportations)
-        foreach (var next in method.EnumerateReachableTargets(zone))
+        foreach (var method in manager.EventTransportations)
         {
-            if (GameState.TerritoryType == method.SourceZone &&
-                !method.IsEventNearby()                      &&
-                Sheets.SpeedDetectionZones.ContainsKey(method.SourceZone))
+            if (GameState.TerritoryType == method.SourceZone              &&
+                Sheets.SpeedDetectionZones.ContainsKey(method.SourceZone) &&
+                !method.IsEventNearby())
                 continue;
-            edges.Add(new EventHop(method, next));
+
+            if (!edges.TryGetValue(method.SourceZone, out var zoneEdges))
+                edges[method.SourceZone] = zoneEdges = [];
+
+            foreach (var target in method.EnumerateReachableTargets(method.SourceZone))
+                zoneEdges.Add(new EventHop(method, target));
         }
 
-        foreach (var record in AetheryteRecordManager.Instance().AllRecords)
+        return new
+        (
+            edges.ToDictionary
+            (
+                x => x.Key,
+                x => x.Value.Select
+                (hop => new PathConnection
+                 (
+                     hop,
+                     hop is EventHop transport ?
+                         transport.Method.Cost :
+                         0
+                 )
+                ).ToArray()
+            ),
+            [.. records.Select(x => new AetheryteHop(x))],
+            TeleportCostCalculator.CaptureTeleportCosts(records, applyTeleportDiscounts),
+            manager.AlwaysMinGilTransport ?
+                0 :
+                manager.config.HopCumulativePenalty
+        );
+    }
+
+    private static Dictionary<uint, PathNode> SearchPaths
+    (
+        PathSearchContext context,
+        uint              source,
+        HashSet<uint>     pendingTargets,
+        CancellationToken cancellationToken
+    )
+    {
+        var root      = new PathNode(new(source, Vector3.Zero), new(0, 0, 0), 0, null, null);
+        var bestKnown = new Dictionary<PathState, PathNode> { [root.State] = root };
+        var routes    = new Dictionary<uint, PathNode>();
+        var edges     = new Dictionary<uint, PathConnection[]>();
+        var queue     = new PriorityQueue<PathNode, PathCost>();
+        queue.Enqueue(root, root.Cost);
+
+        while (pendingTargets.Count > 0 &&
+               queue.TryDequeue(out var node, out _))
         {
-            if (record.ZoneID == zone) continue;
-            if (!AetheryteRecords.AethernetGroups.Contains(record.Group)) continue;
-            edges.Add(new AetheryteHop(record));
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!ReferenceEquals(bestKnown[node.State], node))
+                continue;
+
+            if (pendingTargets.Remove(node.State.Zone))
+                routes[node.State.Zone] = node;
+
+            if (pendingTargets.Count == 0)
+                break;
+
+            if (!edges.TryGetValue(node.State.Zone, out var zoneEdges))
+            {
+                var connections = new List<PathConnection>(context.Aetherytes.Length);
+
+                if (context.Edges.TryGetValue(node.State.Zone, out var localEdges))
+                    connections.AddRange(localEdges);
+
+                foreach (var aetheryte in context.Aetherytes)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (aetheryte.TargetZone != node.State.Zone)
+                        connections.Add(new(aetheryte, context.TeleportCost(node.State.Zone, aetheryte.Record)));
+                }
+
+                edges[node.State.Zone] = zoneEdges = [.. connections];
+            }
+
+            foreach (var (hop, connectionCost) in zoneEdges)
+            {
+                var arrival = hop switch
+                {
+                    AetheryteHop aetheryte => aetheryte.Record.Position,
+                    TelepotTownHop town    => town.Target.Position,
+                    _                      => Vector3.Zero
+                };
+                var state = new PathState(hop.TargetZone, arrival);
+                var cost = new PathCost
+                (
+                    node.Cost.EffectiveCost + connectionCost + ((uint)node.Cost.Hops * context.HopPenalty),
+                    node.Cost.TeleportTownHops +
+                    (hop is TelepotTownHop ?
+                         1 :
+                         0),
+                    node.Cost.Hops + 1
+                );
+
+                if (bestKnown.TryGetValue(state, out var known) &&
+                    known.Cost.CompareTo(cost) <= 0)
+                    continue;
+
+                var next = new PathNode
+                (
+                    state,
+                    cost,
+                    node.DisplayGilCost + connectionCost,
+                    node,
+                    hop
+                );
+                bestKnown[state] = next;
+                queue.Enqueue(next, cost);
+            }
         }
 
-        return edges;
+        return routes;
     }
 
     #endregion
@@ -371,6 +419,7 @@ public unsafe partial class MovementManager
     private readonly record struct PathCost
     (
         uint EffectiveCost,
+        int  TeleportTownHops,
         int  Hops
     ) : IComparable<PathCost>
     {
@@ -380,21 +429,36 @@ public unsafe partial class MovementManager
         )
         {
             var cmp = EffectiveCost.CompareTo(other.EffectiveCost);
+            if (cmp != 0)
+                return cmp;
+
+            cmp = TeleportTownHops.CompareTo(other.TeleportTownHops);
             return cmp != 0 ?
                        cmp :
                        Hops.CompareTo(other.Hops);
         }
     }
 
-    private readonly record struct PathEdge
+    private sealed record PathSearchContext
     (
-        ZoneHop   Hop,
-        PathState PrevState
+        Dictionary<uint, PathConnection[]> Edges,
+        AetheryteHop[]                     Aetherytes,
+        Func<uint, AetheryteRecord, uint>  TeleportCost,
+        uint                               HopPenalty
     );
 
-    #region 常量
+    private sealed record PathNode
+    (
+        PathState State,
+        PathCost  Cost,
+        uint      DisplayGilCost,
+        PathNode? Previous,
+        ZoneHop?  Hop
+    );
 
-    private const uint TELEPORT_TICKET_ITEM_ID = 7569;
-
-    #endregion
+    private readonly record struct PathConnection
+    (
+        ZoneHop Hop,
+        uint    Cost
+    );
 }

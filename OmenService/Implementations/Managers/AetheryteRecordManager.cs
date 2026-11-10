@@ -6,12 +6,14 @@ using OmenTools.Info.Game.AetheryteRecord.Data;
 using OmenTools.Info.Lumina.ExtraSheets;
 using OmenTools.Interop.Game.Lumina;
 using OmenTools.OmenService.Abstractions;
+using TerritoryIntendedUse = FFXIVClientStructs.FFXIV.Client.Enums.TerritoryIntendedUse;
 
 namespace OmenTools.OmenService;
 
 public class AetheryteRecordManager
 (
-    GameState gameState
+    GameState       gameState,
+    MovementManager movementManager
 ) : OmenServiceBase<AetheryteRecordManager>
 {
     public string HouseApartmentTemplate { get; set; } = "{houseType}（{zoneName}第{ward}区{plot}号房间）";
@@ -21,6 +23,8 @@ public class AetheryteRecordManager
     public string HousePersonalName      { get; set; } = "个人房屋";
 
     public Dictionary<string, List<AetheryteRecord>> Records { get; private set; } = [];
+
+    private CancellationTokenSource refreshCancellation = new();
 
     /// <remarks>
     ///     如果需要获取公寓，请使用 <see cref="EstateType.ApartmentBuilding" /> 来筛选。
@@ -34,6 +38,27 @@ public class AetheryteRecordManager
                 yield return record;
         }
     }
+
+    /// <summary>
+    ///     仅包含 Aetheryte 表中的以太之光，不含任何自定义
+    /// </summary>
+    public IEnumerable<AetheryteRecord> GameRecords
+    {
+        get
+        {
+            foreach (var list in Records.Values)
+            foreach (var record in list)
+            {
+                if (record.RowID == 0)
+                    continue;
+
+                yield return record;
+            }
+        }
+    }
+
+    public static bool IsInAethernetTerritory() =>
+        GameState.TerritoryIntendedUse is TerritoryIntendedUse.Town or TerritoryIntendedUse.GoldSaucer;
 
     public AetheryteRecord? GetNearestAetheryte
     (
@@ -61,20 +86,28 @@ public class AetheryteRecordManager
         if (GameState.IsLoggedIn)
         {
             BuildRecords();
-            RefreshRecords();
+            BeginRefresh();
         }
 
         IClientState.Instance().TerritoryChanged += OnZoneChanged;
         gameState.Login                          += OnLogin;
         gameState.WorldChanged                   += OnWorldChanged;
+        gameState.Logout                         += OnLogout;
     }
 
     protected override void Uninit()
     {
+        refreshCancellation.Cancel();
+        refreshCancellation.Dispose();
+
         IClientState.Instance().TerritoryChanged -= OnZoneChanged;
         gameState.Login                          -= OnLogin;
         gameState.WorldChanged                   -= OnWorldChanged;
+        gameState.Logout                         -= OnLogout;
     }
+
+    private void OnLogout() =>
+        refreshCancellation.Cancel();
 
     private void OnWorldChanged
     (
@@ -82,7 +115,7 @@ public class AetheryteRecordManager
     )
     {
         BuildRecords();
-        RefreshRecords();
+        BeginRefresh();
     }
 
     private void OnLogin()
@@ -90,7 +123,7 @@ public class AetheryteRecordManager
         if (!GameState.IsLoggedIn) return;
 
         BuildRecords();
-        RefreshRecords();
+        BeginRefresh();
     }
 
     private void OnZoneChanged
@@ -98,11 +131,13 @@ public class AetheryteRecordManager
         uint zone
     )
     {
+        refreshCancellation.Cancel();
+
         if (GameState.ContentFinderCondition != 0 ||
             !GameState.IsLoggedIn)
             return;
 
-        RefreshRecords();
+        BeginRefresh();
     }
 
     private void BuildRecords()
@@ -112,11 +147,11 @@ public class AetheryteRecordManager
         var pendingRecords = LuminaGetter.Get<Aetheryte>()
                                          .OrderBy(x => x.AethernetGroup)
                                          .ThenBy(x => x.Territory.RowId);
-        
+
         foreach (var data in pendingRecords)
         {
             var record = AetheryteRecord.Parse(data);
-            if (record == null || 
+            if (record == null ||
                 !record.IsUnlocked())
                 continue;
 
@@ -150,12 +185,133 @@ public class AetheryteRecordManager
         BuildFirmamentRecords();
         BuildCosmicExplorationRecords();
         BuildHouseRecords();
+        BuildEventTransportRecords();
     }
 
-    private void RefreshRecords()
+    private void BuildEventTransportRecords()
     {
-        foreach (var record in AllRecords)
-            record.Update();
+        var existingZones = AllRecords.Select(x => x.ZoneID).ToHashSet();
+        var targetTransports = movementManager.EventTransportations
+                                              .SelectMany(x => x.TargetZones, (transport, zoneID) => (ZoneID: zoneID, Transport: transport))
+                                              .GroupBy(x => x.ZoneID, x => x.Transport)
+                                              .OrderBy(x => x.Key);
+
+        foreach (var transports in targetTransports)
+        {
+            var zoneID = transports.Key;
+            if (existingZones.Contains(zoneID))
+                continue;
+
+            var territory = LuminaGetter.GetRowOrDefault<TerritoryType>(zoneID);
+            var name      = territory.PlaceName.Value.Name.ToString();
+            if (string.IsNullOrWhiteSpace(name))
+                continue;
+
+            var version = zoneID == 1055 ?
+                              4U :
+                              territory.ExVersion.RowId;
+            var regionName = zoneID switch
+            {
+                1061 => LuminaWrapper.GetZonePlaceName(156),
+                1360 => LuminaWrapper.GetZonePlaceName(144),
+                1055 => name,
+                _ => territory.TerritoryIntendedUse.RowId is 41 or 48 or 61 ?
+                         territory.ContentFinderCondition.Value.ContentType.Value.Name.ToString() :
+                         territory.PlaceNameZone.Value.Name.ToString()
+            };
+
+            if (string.IsNullOrWhiteSpace(regionName))
+            {
+                var entranceZones = transports.Select(x => x.SourceZone).ToHashSet();
+                regionName = AllRecords.Where(x => entranceZones.Contains(x.ZoneID))
+                                       .Select(x => x.RegionName)
+                                       .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
+            }
+
+            var record = new AetheryteRecord
+            (
+                0,
+                0,
+                252,
+                version,
+                zoneID,
+                territory.Map.RowId,
+                false,
+                Vector3.Zero,
+                name
+            )
+            {
+                RegionName     = regionName,
+                EventTransport = transports.First()
+            };
+
+            var category = $"{version + 2}.0";
+
+            if (version == 0)
+            {
+                var region = territory.PlaceNameRegion.Value;
+                category = region.RowId is 22 or 23 or 24 ?
+                               region.Name.ToString() :
+                               VERSION_OTHER;
+            }
+
+            if (zoneID is 1061 or 1360)
+                category = VERSION_OTHER;
+
+            Records.TryAdd(category, []);
+            Records[category].Add(record);
+        }
+
+        foreach (var records in Records.Values)
+        {
+            var transports = records.Where(x => x.Group == 252)
+                                    .OrderBy(x => x.RegionName, StringComparer.Ordinal)
+                                    .ThenBy(x => x.ZoneID)
+                                    .ToList();
+            records.RemoveAll(x => x.Group == 252);
+            records.AddRange(transports);
+        }
+    }
+
+    private void BeginRefresh()
+    {
+        refreshCancellation.Cancel();
+        refreshCancellation.Dispose();
+        refreshCancellation = new();
+        _                   = RefreshRecordsAsync(refreshCancellation.Token);
+    }
+
+    private async Task RefreshRecordsAsync
+    (
+        CancellationToken cancellationToken
+    )
+    {
+        try
+        {
+            var records = AllRecords.ToList();
+
+            var routeCosts = await MovementManager.FindRouteCostsAsync
+                             (
+                                 GameState.TerritoryType,
+                                 [.. records.Select(x => x.ZoneID).Distinct()],
+                                 cancellationToken
+                             ).ConfigureAwait(false);
+            await IFramework.Instance().Run
+            (
+                () =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    foreach (var record in records)
+                        record.Update(routeCosts.GetValueOrDefault(record.ZoneID, 0U));
+                },
+                cancellationToken
+            );
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // ignored
+        }
     }
 
     private void BuildHouseRecords()
@@ -168,6 +324,7 @@ public class AetheryteRecordManager
         // 公寓
         var aptBuilding = HousingManager.GetOwnedHouseId(EstateType.ApartmentBuilding);
         var aptRoom     = HousingManager.GetOwnedHouseId(EstateType.ApartmentRoom);
+
         if (aptBuilding.Id != INVALID_HOUSE_ID && aptRoom.Id != INVALID_HOUSE_ID)
         {
             TryAddHouseRecord
@@ -187,6 +344,7 @@ public class AetheryteRecordManager
 
         // 个人房
         var personalInfo = HousingManager.GetOwnedHouseId(EstateType.PersonalEstate);
+
         if (personalInfo.Id != INVALID_HOUSE_ID)
         {
             TryAddHouseRecord
@@ -206,6 +364,7 @@ public class AetheryteRecordManager
 
         // 部队房
         var fcInfo = HousingManager.GetOwnedHouseId(EstateType.FreeCompanyEstate);
+
         if (fcInfo.Id != INVALID_HOUSE_ID)
         {
             TryAddHouseRecord
@@ -229,7 +388,7 @@ public class AetheryteRecordManager
             var sharedInfo = HousingManager.GetOwnedHouseId(EstateType.SharedEstate, i);
             if (sharedInfo.Id == INVALID_HOUSE_ID)
                 continue;
-            
+
             TryAddHouseRecord
             (
                 housingMarkers,
@@ -277,7 +436,7 @@ public class AetheryteRecordManager
                 ["zoneName"]  = territoryName,
                 ["houseType"] = houseTypeName,
                 ["ward"]      = nameArgs[0],
-                ["plot"]      = nameArgs[1],
+                ["plot"]      = nameArgs[1]
             }
         );
 
@@ -296,7 +455,7 @@ public class AetheryteRecordManager
         {
             IsHouse         = true,
             HouseType       = houseType,
-            ShareHouseIndex = shareHouseIndex,
+            ShareHouseIndex = shareHouseIndex
         };
 
         Records.TryAdd(VERSION_OTHER, []);
@@ -343,7 +502,7 @@ public class AetheryteRecordManager
 
             var record = new AetheryteRecord
             (
-                70,
+                0,
                 (byte)index,
                 254,
                 1,
@@ -376,7 +535,7 @@ public class AetheryteRecordManager
                 var placeName = LuminaWrapper.GetPlaceName(index + offset);
                 var record = new AetheryteRecord
                 (
-                    175,
+                    0,
                     index,
                     253,
                     version,

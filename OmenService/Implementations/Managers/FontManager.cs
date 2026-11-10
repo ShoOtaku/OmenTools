@@ -9,7 +9,6 @@ using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Utility;
 using Microsoft.Win32;
 using OmenTools.Dalamud;
-using OmenTools.Interop.Windows.Models;
 using OmenTools.OmenService.Abstractions;
 
 namespace OmenTools.OmenService;
@@ -50,7 +49,7 @@ public class FontManager
             }
 
             builder.AddText("ΑαΒβΓγΔδΕεΖζΗηΘθΙιΚκΛλΜμΝνΞξΟοΠπΡρΣσΤτΥυΦφΧχΨψΩω");
-            builder.AddText("←→↑↓《》■※☀★★☆♥♡ヅツッシ☀☁☂℃℉°♀♂♠♣♦♣♧®©™€$£♯♭♪✓√◎◆◇♦■□〇●△▽▼▲‹›≤≥≈<«─＼～⅓½¼⅔¾✓✗");
+            builder.AddText("↔←→↑↓《》■※☀★★☆♥♡ヅツッシ☀☁☂℃℉°♀♂♠♣♦♣♧®©™€$£♯♭♪✓√◎◆◇♦■□〇●△▽▼▲‹›≤≥≈<«─＼～⅓½¼⅔¾✓✗");
             builder.AddText("ŒœĂăÂâÎîȘșȚț");
             builder.AddChar('⓪');
 
@@ -116,8 +115,12 @@ public class FontManager
     public IFontHandle UIFont80  => GetUIFont(0.8f);
     public IFontHandle UIFont60  => GetUIFont(0.6f);
 
-    public float GlobalFontScale => Config.FontSize / 12f * ImGuiHelpers.GlobalScale;
-    public bool  IsFontBuilding  => activeFontBuilds > 0;
+    /// <summary>
+    /// 获取应用配置缩放后的界面字体相对于 16 像素基准字号的显示倍率，包含一次 Dalamud 全局界面缩放。
+    /// </summary>
+    public float GlobalFontScale => GetActualFontSize(1f) / DEFAULT_FONT_SIZE * ImGuiHelpers.GlobalScale;
+
+    public bool IsFontBuilding => activeFontBuilds > 0;
 
     public IFontHandle GetUIFont
     (
@@ -125,11 +128,16 @@ public class FontManager
     ) =>
         GetFont(GetActualFontSize(scale));
 
+    /// <summary>
+    /// 获取用于字体图集构建的像素字号，不包含由图集负责处理的 Dalamud 全局界面缩放。
+    /// </summary>
+    /// <param name="scale">相对于应用配置缩放后的 Dalamud 默认字号的倍率。</param>
+    /// <returns>Dalamud 当前默认字号乘以配置缩放和指定倍率，保留两位小数。</returns>
     public float GetActualFontSize
     (
         float scale
     ) =>
-        MathF.Round(Config.FontSize * scale * ImGuiHelpers.GlobalScale, 1);
+        MathF.Round(IUiBuilder.Instance().FontDefaultSizePx * Config.FontScale * scale, 2);
 
     public IFontHandle GetFont
     (
@@ -150,23 +158,31 @@ public class FontManager
         return AxisFont180;
     }
 
+    /// <summary>
+    /// 串行重建界面字体，并预构建常用的相对字号。
+    /// </summary>
+    /// <param name="clearOld">是否清除已有字体句柄并重新创建图集。</param>
+    /// <returns>在本次字体图集构建完成后结束的任务。</returns>
     public async Task RebuildUIFontsAsync
     (
         bool clearOld = true
     )
     {
-        if (clearOld)
-            ClearFontHandles();
-
-        var sizes = PreBuildFontSizes.Select(GetActualFontSize)
-                                     .Distinct()
-                                     .ToArray();
-
         await semaphore.WaitAsync();
         Interlocked.Increment(ref activeFontBuilds);
 
         try
         {
+            if (cancelSource.IsCancellationRequested)
+                return;
+
+            if (clearOld)
+                ClearFontHandles();
+
+            var sizes = PREBUILD_FONT_SCALES.Select(GetActualFontSize)
+                                            .Distinct()
+                                            .ToArray();
+
             foreach (var size in sizes)
             {
                 if (fontTasks.ContainsKey(size)) continue;
@@ -209,7 +225,7 @@ public class FontManager
 
     private IFontAtlas? FontAtlas { get; set; }
 
-    private readonly SemaphoreSlim           semaphore    = new(Environment.ProcessorCount, Environment.ProcessorCount);
+    private readonly SemaphoreSlim           semaphore    = new(1, 1);
     private readonly CancellationTokenSource cancelSource = new();
 
     private readonly ConcurrentDictionary<float, Task<IFontHandle>> fontTasks = [];
@@ -219,12 +235,16 @@ public class FontManager
     protected override void Init()
     {
         Config = LoadConfig<FontManagerConfig>() ?? new();
+        ClearFontHandles();
+
+        IUiBuilder.Instance().DefaultFontChanged        += OnDalamudFontChanged;
+        IUiBuilder.Instance().DefaultGlobalScaleChanged += OnDalamudFontChanged;
 
         Task.Run
         (
             async () => await Task.WhenAll
                         (
-                            RebuildUIFontsAsync(),
+                            RebuildUIFontsAsync(false),
                             Task.Run(RegenerateInstalledFonts, cancelSource.Token)
                         ),
             cancelSource.Token
@@ -233,11 +253,36 @@ public class FontManager
 
     protected override void Uninit()
     {
-        cancelSource.Cancel();
-        cancelSource.Dispose();
+        IUiBuilder.Instance().DefaultFontChanged        -= OnDalamudFontChanged;
+        IUiBuilder.Instance().DefaultGlobalScaleChanged -= OnDalamudFontChanged;
 
-        fontTasks.Clear();
-        FontAtlas?.Dispose();
+        cancelSource.Cancel();
+
+        _ = DisposeFontsAsync();
+    }
+
+    private async Task DisposeFontsAsync()
+    {
+        await semaphore.WaitAsync();
+
+        try
+        {
+            fontTasks.Clear();
+            FontAtlas?.Dispose();
+            cancelSource.Dispose();
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+
+    private void OnDalamudFontChanged()
+    {
+        if (cancelSource.IsCancellationRequested)
+            return;
+
+        _ = RebuildUIFontsAsync(false);
     }
 
     private IFontHandle CreateFontHandleDefinition
@@ -245,42 +290,8 @@ public class FontManager
         float size
     )
     {
-        var fontPath = Config.FontFileName;
-
-        if (!File.Exists(fontPath))
-        {
-            return FontAtlas.NewDelegateFontHandle
-            (e =>
-                {
-                    e.OnPreBuild
-                    (tk =>
-                        {
-                            var defualtFontPtr = tk.AddDalamudDefaultFont(size, DefaultFontRange);
-
-                            var mixedFontPtr0 = tk.AddGameSymbol
-                            (
-                                new()
-                                {
-                                    SizePx     = size,
-                                    PixelSnapH = true,
-                                    MergeFont  = defualtFontPtr
-                                }
-                            );
-
-                            tk.AddFontAwesomeIconFont
-                            (
-                                new()
-                                {
-                                    SizePx     = size,
-                                    PixelSnapH = true,
-                                    MergeFont  = mixedFontPtr0
-                                }
-                            );
-                        }
-                    );
-                }
-            );
-        }
+        var fontPath      = Config.FontFileName;
+        var iconFontIndex = 0;
 
         return FontAtlas.NewDelegateFontHandle
         (e =>
@@ -288,36 +299,55 @@ public class FontManager
                 e.OnPreBuild
                 (tk =>
                     {
-                        var fileFontPtr = tk.AddFontFromFile
-                        (
-                            fontPath,
-                            new()
-                            {
-                                SizePx      = size,
-                                PixelSnapH  = true,
-                                GlyphRanges = DefaultFontRange,
-                                FontNo      = Config.FontFaceIndex
-                            }
-                        );
+                        var font = File.Exists(fontPath) ?
+                                       tk.AddFontFromFile
+                                       (
+                                           fontPath,
+                                           new()
+                                           {
+                                               SizePx      = size,
+                                               PixelSnapH  = true,
+                                               GlyphRanges = DefaultFontRange,
+                                               FontNo      = Config.FontFaceIndex
+                                           }
+                                       ) :
+                                       tk.AddDalamudDefaultFont(size, DefaultFontRange);
 
-                        var mixedFontPtr0 = tk.AddGameSymbol
+                        tk.AddGameSymbol
                         (
                             new()
                             {
                                 SizePx     = size,
                                 PixelSnapH = true,
-                                MergeFont  = fileFontPtr
+                                MergeFont  = font
                             }
                         );
 
+                        iconFontIndex = tk.Fonts.Length;
                         tk.AddFontAwesomeIconFont
                         (
                             new()
                             {
                                 SizePx     = size,
-                                PixelSnapH = true,
-                                MergeFont  = mixedFontPtr0
+                                PixelSnapH = true
                             }
+                        );
+                    }
+                );
+
+                e.OnPostBuild
+                (tk =>
+                    {
+                        var iconFont = tk.Fonts[iconFontIndex];
+                        tk.FitRatio(iconFont);
+                        iconFont.Ascent = tk.Font.Ascent;
+                        tk.CopyGlyphsAcrossFonts
+                        (
+                            iconFont,
+                            tk.Font,
+                            missingOnly: false,
+                            rangeLow: '',
+                            rangeHigh: ''
                         );
                     }
                 );
@@ -335,11 +365,14 @@ public class FontManager
 
         try
         {
+            if (cancelSource.IsCancellationRequested)
+                throw new OperationCanceledException();
+
             var handle = CreateFontHandleDefinition(size);
             await FontAtlas.BuildFontsAsync();
             return handle;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancelSource.IsCancellationRequested)
         {
             notifyHelper.NotificationError($"字体 (大小: {size}) 构建失败");
             DLog.Error($"构建字体 (大小: {size}) 失败", ex);
@@ -652,14 +685,18 @@ public class FontManager
 
     public sealed class FontManagerConfig : OmenServiceConfig
     {
-        public float  FontSize     = 20f;
+        /// <summary>
+        /// 相对于 Dalamud 默认字号的缩放倍率，默认为 1，随 Dalamud 的默认字号变化。
+        /// </summary>
+        public float FontScale = 1f;
+
         public string FontFileName = string.Empty;
         public int    FontFaceIndex;
 
         public void Save() =>
             this.Save(Instance());
     }
-    
+
     public sealed record FontFace
     (
         string FilePath,
@@ -698,8 +735,6 @@ public class FontManager
     private readonly Lazy<IFontHandle> trumpGothicFont340Lazy = new(() => FontAtlasGame.NewGameFontHandle(new(GameFontFamilyAndSize.TrumpGothic34)));
     private readonly Lazy<IFontHandle> trumpGothicFont680Lazy = new(() => FontAtlasGame.NewGameFontHandle(new(GameFontFamilyAndSize.TrumpGothic68)));
 
-    private static readonly float[] PreBuildFontSizes = [0.6f, 0.8f, 0.9f, 1.0f, 1.2f, 1.4f, 1.6f];
-
     private static readonly string[] FontExtensions = [".ttf", ".otf", ".ttc", ".otc"];
 
     private static readonly FrozenSet<string> FontExtensionSet = FontExtensions.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
@@ -707,6 +742,10 @@ public class FontManager
     #endregion
 
     #region 常量
+
+    private static readonly float[] PREBUILD_FONT_SCALES = [0.6f, 0.8f, 0.9f, 1.0f, 1.2f, 1.4f, 1.6f];
+
+    private const float DEFAULT_FONT_SIZE = 16f;
 
     private const uint   FONT_COLLECTION_TAG         = 0x74746366;
     private const uint   SFNT_VERSION_TRUETYPE       = 0x00010000;
