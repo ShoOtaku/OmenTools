@@ -18,21 +18,21 @@ using Control = FFXIVClientStructs.FFXIV.Client.Game.Control.Control;
 
 namespace OmenTools.OmenService;
 
-public unsafe partial class MovementManager
+public partial class MovementManager
 {
     private static readonly CompSig CurrentMoveModeInternalSig = new("0F B6 0D ?? ?? ?? ?? B8");
-    private                 byte*   CurrentMoveModeInternal    = null!;
+    private unsafe                 byte*   CurrentMoveModeInternal    = null!;
 
     private static readonly CompSig CurrentZoneMoveStateBaseInstanceSig =
         new
         (
             "48 8D 0D ?? ?? ?? ?? E9 ?? ?? ?? ?? CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 48 89 5C 24 ?? 57 48 83 EC ?? 48 8B B9"
         );
-    private byte* CurrentZoneMoveStateBaseInstance = null!;
+    private unsafe byte* CurrentZoneMoveStateBaseInstance = null!;
 
     private static readonly CompSig GetCurrentZoneMoveStateSig = new("E8 ?? ?? ?? ?? 66 83 C8 40");
 
-    private delegate ushort GetCurrentZoneMoveStateDelegate
+    private unsafe delegate ushort GetCurrentZoneMoveStateDelegate
     (
         byte* instance
     );
